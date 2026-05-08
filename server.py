@@ -630,8 +630,8 @@ async def drip(cid: str):
 
 # ---------- Serve Frontend ----------
 @app.get("/")
-async def serve_frontend():
-    return FileResponse("index.html")
+async def root():
+    return {"message": "OMNI-DRIP API is running"}
 
 # ---------- API Endpoints (all from your original, converted to DB) ----------
 @app.get("/get-api")
