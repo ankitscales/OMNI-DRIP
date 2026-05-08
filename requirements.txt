@@ -6,3 +6,6 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 websockets
+asyncpg
+aiosqlite
+pydantic
