@@ -111,8 +111,8 @@ app.add_middleware(
 )
 
 # ---------- Authentication ----------
-VALID_USERNAME = "admin"
-VALID_PASSWORD = "sharedpass"
+VALID_USERNAME = "sameer"
+VALID_PASSWORD = "bhadwa"
 active_tokens = {}
 security = HTTPBearer()
 
