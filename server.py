@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Dict, Optional, List
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,13 +62,46 @@ campaigns_table = Table(
     Column("social_boost_scheduled", Float, nullable=True),
     Column("social_boost_views", Integer, nullable=True),
     Column("_order_check_time", Float, nullable=True),
+    Column("fail_count", Integer, server_default="0"),
 )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=3600)
 metadata.create_all(engine)
 
-# ---------- FastAPI app ----------
-app = FastAPI(title="OMNI-DRIP ULTRA")
+# ---------- FastAPI app with lifespan ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await database.connect()
+    
+    # Auto-migrate: add fail_count column if it doesn't exist (SQLite)
+    try:
+        await database.execute("ALTER TABLE campaigns ADD COLUMN fail_count INTEGER DEFAULT 0")
+        print("✅ Added fail_count column")
+    except Exception:
+        pass  # column already exists
+    
+    # Recover active campaigns
+    rows = await database.fetch_all(
+        select(campaigns_table).where(campaigns_table.c.status == "active").where(campaigns_table.c.current < campaigns_table.c.target)
+    )
+    recovered = 0
+    for row in rows:
+        cid = row["id"]
+        if cid not in active_tasks:
+            # Reset fail_count for recovered campaigns to avoid immediate pause
+            await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(fail_count=0))
+            active_tasks[cid] = asyncio.create_task(drip(cid))
+            recovered += 1
+    if recovered:
+        print(f"🔄 Recovered {recovered} active campaigns")
+    
+    yield  # The app runs here
+    
+    # Shutdown
+    await database.disconnect()
+
+app = FastAPI(title="OMNI-DRIP ULTRA", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -525,63 +559,157 @@ async def ai_plan(request: dict, token: str = Depends(verify_token)):
         }
     return best
 
-# ---------- Main Drip Loop ----------
+# ---------- Main Drip Loop (FIXED - no infinite retry) ----------
 async def drip(cid: str):
     if cid not in drip_locks:
         drip_locks[cid] = asyncio.Lock()
+
     async with drip_locks[cid]:
         print(f"🚀 Starting drip loop for {cid}")
+
         while True:
-            row = await database.fetch_one(select(campaigns_table).where(campaigns_table.c.id == cid))
+            row = await database.fetch_one(
+                select(campaigns_table).where(campaigns_table.c.id == cid)
+            )
             if not row or row["status"] != "active":
-                print(f"🛑 Campaign {cid} not active (status={row.status if row else 'deleted'}), stopping")
+                print(f"🛑 Campaign {cid} not active, stopping")
                 break
+
             camp = dict(row)
 
+            # ----- COMPLETED -----
             if camp["current"] >= camp["target"]:
-                print(f"✅ Campaign {cid} completed (total {camp['current']} / {camp['target']})")
-                await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="completed", next_drip=0))
+                print(f"✅ Campaign {cid} completed")
+                await database.execute(
+                    campaigns_table.update()
+                    .where(campaigns_table.c.id == cid)
+                    .values(status="completed", next_drip=0, fail_count=0)
+                )
                 await manager.broadcast({"type": "campaign_completed", "campaign_id": cid})
                 break
 
-            if camp.get("last_order_id"):
-                print(f"⏳ Order {camp['last_order_id']} pending – waiting for completion...")
-                await wait_for_order_completion(camp["api_url"], camp["api_key"], camp["last_order_id"], camp)
-                await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(last_order_id=None, _order_check_time=None))
-                continue
-
             now = time.time()
             next_drip_time = camp.get("next_drip", now)
-            if next_drip_time > now:
+            drip_count = camp.get("drip_count", 0)
+            fail_count = camp.get("fail_count", 0)
+
+            # ----- TIMER (always runs) -----
+            if next_drip_time > now and (drip_count > 0 or fail_count > 0):
                 sleep_sec = next_drip_time - now
-                print(f"⏰ Sleeping {sleep_sec:.1f}s until next drip for {cid}")
-                await asyncio.sleep(sleep_sec)
+                print(f"⏰ Sleeping {sleep_sec:.1f}s until next drip")
+                await asyncio.sleep(min(sleep_sec, 60))  # never sleep more than 60s at a time
                 continue
 
-            scheduler = AdaptiveDripScheduler(camp)
-            views = scheduler.determine_views()
+            # ----- CHECK PENDING ORDER (only when timer expired) -----
+            if camp.get("last_order_id"):
+                order_id = camp["last_order_id"]
+                api_url = camp["api_url"]
+                api_key = camp["api_key"]
+                completed = False
+
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        for param in ["order", "order_id"]:
+                            r = await client.post(api_url, data={
+                                "key": api_key,
+                                "action": "status",
+                                param: order_id
+                            })
+                            if r.status_code == 200:
+                                data = r.json() if r.text.strip() else {}
+                                status = (
+                                    data.get("status") or
+                                    data.get("order_status") or
+                                    data.get("state") or ""
+                                ).strip().lower()
+                                if status in ["completed","success","finished","done","complete"]:
+                                    completed = True
+                                    print(f"✅ Order {order_id} completed")
+                                    break
+                                else:
+                                    print(f"⏳ Order {order_id} still {status}")
+                                    break
+                except Exception as e:
+                    print(f"⚠️ Status check error: {e}")
+
+                if completed:
+                    await database.execute(
+                        campaigns_table.update()
+                        .where(campaigns_table.c.id == cid)
+                        .values(last_order_id=None, _order_check_time=None)
+                    )
+                    # Continue to send next drip immediately
+                else:
+                    # Order still pending – wait 30 seconds and check again
+                    await database.execute(
+                        campaigns_table.update()
+                        .where(campaigns_table.c.id == cid)
+                        .values(next_drip=time.time() + 30)
+                    )
+                    continue  # go back to top, timer will sleep 30s
+
+            # ----- FORCE FIRST DRIP -----
+            if drip_count == 0 and fail_count == 0:
+                await database.execute(
+                    campaigns_table.update()
+                    .where(campaigns_table.c.id == cid)
+                    .values(next_drip=time.time())
+                )
+                camp["next_drip"] = time.time()
+                print(f"🔥 FIRST DRIP FORCED")
+
+            # ----- CALCULATE VIEWS (keep your existing logic) -----
             remaining = camp["target"] - camp["current"]
-            
-            # Enforce minimum views (never below 100 unless finishing)
-            min_allowed = max(camp.get("min_views", 100), 100)
-            if remaining >= min_allowed:
-                views = max(views, min_allowed)
+            min_allowed = max(int(camp.get("min_views", 100)), 100)
+            max_allowed = int(camp.get("max_views", 0) or 0)
+            if max_allowed <= 0:
+                max_allowed = max(min_allowed * 3, int(camp["target"] * 0.12))
+            max_allowed = min(max_allowed, int(camp["target"] * 0.35))
+
+            progress = camp["current"] / max(1, camp["target"])
+            x = progress * 12 - 6
+            sigmoid_weight = (math.exp(-x) / ((1 + math.exp(-x)) ** 2))
+            normalized = math.pow(sigmoid_weight * 5.8, 1.35)
+            curve_boost = 1 + (progress * 1.8)
+            views = int(min_allowed + ((max_allowed - min_allowed) * normalized * curve_boost))
+            randomness = random.uniform(0.82, 1.18)
+            views = int(views * randomness)
+
+            if camp.get("last_views"):
+                previous = camp["last_views"]
+                min_growth = int(previous * 0.65)
+                max_growth = int(previous * 2.3)
+                views = max(min_growth, views)
+                views = min(max_growth, views)
+
+            views = max(min_allowed, views)
+            views = min(max_allowed, views)
+            if remaining < min_allowed:
+                views = remaining
             else:
-                views = max(views, remaining)   # final drip can be smaller to finish
+                views = min(views, remaining)
 
-            views = min(views, remaining)        # cap to remaining
-
+            step = 100
+            views = round(views / step) * step
+            if views < step:
+                views = step
+            if views > remaining:
+                views = remaining
             if views <= 0:
                 views = min_allowed
-                if views > remaining:
-                    views = remaining
 
-            if views == 0:
-                print(f"⚠️ No views to send for {cid}, retry in 60s")
-                await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(next_drip=time.time() + 60))
-                continue
+            # ----- INTERVAL – USE EXACT USER MINUTES -----
+            base_interval_minutes = int(camp.get("drip_interval_minutes", 35))
+            interval_sec = base_interval_minutes * 60
+            # Safety: never less than 60 seconds
+            if interval_sec < 60:
+                interval_sec = 60
+                
+            next_drip_time = time.time() + interval_sec
+            print(f"⏱️ Next drip in {interval_sec} seconds (user requested {base_interval_minutes} minutes)")
 
-            print(f"📤 Sending order for {cid}: {views} views (remaining {remaining})")
+            # ----- SEND ORDER -----
+            print(f"📤 Sending order: {views} views (remaining {remaining})")
             try:
                 start_order = time.time()
                 async with httpx.AsyncClient(timeout=20.0) as client:
@@ -596,10 +724,13 @@ async def drip(cid: str):
                         }
                     )
                     if r.status_code in [200, 201]:
-                        resp = r.json() if r.text.strip() else {}
+                        try:
+                            resp = r.json() if r.text.strip() else {}
+                        except:
+                            resp = {}
                         if not resp.get("error"):
                             new_current = camp["current"] + views
-                            new_drip_count = camp.get("drip_count", 0) + 1
+                            new_drip_count = drip_count + 1
                             order_id = resp.get("order") or resp.get("order_id")
                             history = camp.get("history", [])
                             history.append({
@@ -610,45 +741,63 @@ async def drip(cid: str):
                             })
                             if len(history) > 50:
                                 history = history[-50:]
-
-                            interval_sec = scheduler.determine_interval(views)
-                            next_drip = time.time() + interval_sec
-
                             update_data = {
                                 "current": new_current,
                                 "last_views": views,
                                 "drip_count": new_drip_count,
                                 "history": history,
                                 "last_order_duration": time.time() - start_order,
-                                "next_drip": next_drip,
+                                "next_drip": next_drip_time,
+                                "fail_count": 0,
                             }
                             if order_id:
                                 update_data["last_order_id"] = int(order_id)
                                 update_data["_order_check_time"] = time.time()
                             else:
                                 update_data["last_order_id"] = None
-
-                            await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(**update_data))
+                            await database.execute(
+                                campaigns_table.update()
+                                .where(campaigns_table.c.id == cid)
+                                .values(**update_data)
+                            )
                             await manager.broadcast({
                                 "type": "drip_event",
                                 "campaign_id": cid,
                                 "views": views,
                                 "total": new_current
                             })
-                            print(f"✅ Order placed – new total {new_current}/{camp['target']}, next drip in {interval_sec:.0f}s")
+                            print(f"✅ Order placed ({views} views) → total {new_current}/{camp['target']}")
                             continue
-                    else:
-                        print(f"❌ Order failed with HTTP {r.status_code}: {r.text[:200]}")
+                    print(f"❌ Order failed HTTP {r.status_code}: {r.text[:200]}")
             except Exception as e:
                 print(f"❌ Order exception: {e}")
-            # Order failed – retry in 2 minutes
-            await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(next_drip=time.time() + 120))
 
+            # ----- ORDER FAILED – increment counter -----
+            new_fail_count = fail_count + 1
+            if new_fail_count >= 3:
+                print(f"❌ Too many failures, pausing campaign")
+                await database.execute(
+                    campaigns_table.update()
+                    .where(campaigns_table.c.id == cid)
+                    .values(status="paused", fail_count=new_fail_count, next_drip=time.time() + 300)
+                )
+                await manager.broadcast({"type": "campaign_paused_due_to_errors", "campaign_id": cid})
+                break
+            else:
+                print(f"⚠️ Failure {new_fail_count}/3, retrying in 60s")
+                await database.execute(
+                    campaigns_table.update()
+                    .where(campaigns_table.c.id == cid)
+                    .values(fail_count=new_fail_count, next_drip=time.time() + 60)
+                )
+
+    # cleanup
     if cid in active_tasks:
         del active_tasks[cid]
     if cid in drip_locks:
         del drip_locks[cid]
     print(f"💤 Drip loop for {cid} terminated")
+
 
 # ---------- API Endpoints ----------
 @app.get("/")
@@ -748,6 +897,7 @@ async def launch(config: CampaignConfig, token: str = Depends(verify_token)):
         social_boost_scheduled=None,
         social_boost_views=None,
         _order_check_time=None,
+        fail_count=0,
     ))
     if cid in active_tasks:
         active_tasks[cid].cancel()
@@ -762,7 +912,7 @@ async def stop(cid: str, token: str = Depends(verify_token)):
     camp = await database.fetch_one(select(campaigns_table).where(campaigns_table.c.id == cid))
     if not camp:
         raise HTTPException(status_code=404)
-    await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="stopped"))
+    await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="stopped", fail_count=0))
     if cid in active_tasks:
         active_tasks[cid].cancel()
         del active_tasks[cid]
@@ -784,7 +934,7 @@ async def resume(cid: str, token: str = Depends(verify_token)):
     camp = await database.fetch_one(select(campaigns_table).where(campaigns_table.c.id == cid))
     if not camp or camp["status"] != "paused" or camp["current"] >= camp["target"]:
         raise HTTPException(status_code=404)
-    await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="active"))
+    await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="active", fail_count=0, next_drip=time.time()))
     if cid not in active_tasks:
         active_tasks[cid] = asyncio.create_task(drip(cid))
     return {"status": "resumed"}
@@ -871,7 +1021,7 @@ async def bulk_resume(token: str = Depends(verify_token)):
     resumed = 0
     for row in rows:
         cid = row["id"]
-        await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="active"))
+        await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="active", fail_count=0, next_drip=time.time()))
         if cid not in active_tasks:
             active_tasks[cid] = asyncio.create_task(drip(cid))
         resumed += 1
@@ -896,7 +1046,7 @@ async def bulk_stop(token: str = Depends(verify_token)):
     stopped = 0
     for row in rows:
         cid = row["id"]
-        await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="stopped"))
+        await database.execute(campaigns_table.update().where(campaigns_table.c.id == cid).values(status="stopped", fail_count=0))
         if cid in active_tasks:
             active_tasks[cid].cancel()
             del active_tasks[cid]
@@ -913,24 +1063,6 @@ async def force_complete(cid: str, token: str = Depends(verify_token)):
         await manager.broadcast({"type": "force_complete", "campaign_id": cid})
         return {"status": "completed", "message": "Order manually completed"}
     return {"status": "no_pending_order", "message": "No order to complete"}
-
-# ---------- Lifespan ----------
-@app.on_event("startup")
-async def startup():
-    await database.connect()
-    rows = await database.fetch_all(select(campaigns_table).where(campaigns_table.c.status == "active").where(campaigns_table.c.current < campaigns_table.c.target))
-    recovered = 0
-    for row in rows:
-        cid = row["id"]
-        if cid not in active_tasks:
-            active_tasks[cid] = asyncio.create_task(drip(cid))
-            recovered += 1
-    if recovered:
-        print(f"🔄 Recovered {recovered} active campaigns")
-
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
