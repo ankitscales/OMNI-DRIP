@@ -111,8 +111,8 @@ app.add_middleware(
 )
 
 # ---------- Authentication ----------
-VALID_USERNAME = "sameer"
-VALID_PASSWORD = "bhadwa"
+VALID_USERNAME = "admin"
+VALID_PASSWORD = "sharedpass"
 active_tokens = {}
 security = HTTPBearer()
 
@@ -800,9 +800,16 @@ async def drip(cid: str):
 
 
 # ---------- API Endpoints ----------
-@app.get("/")
+from fastapi.responses import JSONResponse
+
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"status": "OMNI-DRIP ULTRA API", "message": "Backend is running"}
+    return JSONResponse(
+        content={
+            "status": "OMNI-DRIP ULTRA API",
+            "message": "Backend is running"
+        }
+    )
 
 @app.get("/health")
 async def health_check():
